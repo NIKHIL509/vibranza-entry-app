@@ -1,0 +1,12 @@
+{
+  "name": "vibranza-entry-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VIBRANZA 2026-27 house entry manager — Google Apps Script web app (Vivekananda Public School, Daporijo)",
+  "scripts": {
+    "test": "node tests/rules.test.js",
+    "push": "clasp push -f",
+    "deploy": "clasp push -f && clasp deploy -i $DEPLOYMENT_ID -d \"update\""
+  },
+  "devDependencies": { "@google/clasp": "^2.4.2" }
+}

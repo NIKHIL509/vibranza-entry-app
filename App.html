@@ -1,0 +1,428 @@
+<script>
+/* ================= state + helpers ================= */
+const S = { token: null, d: null, tab: null, f: {} };
+const $ = s => document.querySelector(s);
+const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const yes = v => /^(y|yes|true|1)$/i.test(String(v).trim());
+const H = h => `<span class="house h-${esc(h)}">${esc(h || '—')}</span>`;
+const pill = s => `<span class="pill ${esc(s)}">${esc(s)}</span>`;
+function store(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} }
+function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function toast(msg, err) { const t = $('#toast'); t.textContent = msg; t.className = 'toast show' + (err ? ' err' : ''); clearTimeout(t._h); t._h = setTimeout(() => t.className = 'toast', err ? 6000 : 2500); }
+function api(fn, ...args) {
+  return new Promise((res, rej) => {
+    google.script.run.withSuccessHandler(res).withFailureHandler(e => {
+      const m = (e && e.message) || String(e);
+      if (m.indexOf('SESSION_EXPIRED') >= 0) { store('vz_token', null); S.token = null; toast('Session expired — please log in again.', true); renderLogin(); }
+      rej(new Error(m.replace(/^Error:\s*/, '')));
+    })[fn](...args);
+  });
+}
+function modal(html) { $('#modalBody').innerHTML = html; $('#modal').classList.remove('hidden'); }
+function closeModal() { $('#modal').classList.add('hidden'); }
+$('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
+const evById = id => S.d.events.find(e => String(e.EventID) === String(id)) || {};
+const stuById = id => S.d.students.find(s => String(s.AdmNo) === String(id)) || {};
+const cidx = c => S.d.classes.indexOf(String(c));
+const isEntryEvent = e => String(e.Type).toLowerCase() !== 'no points' && !yes(e.NoEntries);
+const eligible = (e, s) => {
+  const i = cidx(s.Class), a = cidx(e.FromClass), b = cidx(e.ToClass);
+  if (i < 0 || (a >= 0 && i < a) || (b >= 0 && i > b)) return false;
+  if (e.Gender === 'Boys' && s.Gender !== 'Boy') return false;
+  if (e.Gender === 'Girls' && s.Gender !== 'Girl') return false;
+  return true;
+};
+const cnt = (adm, mod) => ((S.d.counts[String(adm)] || {})[mod || 'All']) || 0;
+
+/* ================= boot ================= */
+window.addEventListener('load', () => {
+  if (window.VIEW === 'board') return renderBoard();
+  S.token = load('vz_token');
+  S.token ? refresh() : renderLogin();
+});
+function renderLogin() {
+  $('#who').innerHTML = '';
+  $('#app').innerHTML = `<div class="card login">
+    <h3>Sign in</h3>
+    <p class="muted small">House leaders, house teachers and school authority. Your User ID and PIN are given by the school office.</p>
+    <label>User ID</label><input id="lu" autocomplete="username" placeholder="e.g. GARUDA-T1">
+    <label>PIN</label><input id="lp" type="password" inputmode="numeric" autocomplete="current-password">
+    <div style="margin-top:14px"><button class="btn" style="width:100%" onclick="doLogin()">Sign in</button></div>
+    <p class="small muted" style="margin-top:14px">Live scoreboard: add <b>?view=board</b> to this page's address.</p></div>`;
+  $('#lp').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+}
+async function doLogin() {
+  try { const r = await api('login', $('#lu').value, $('#lp').value); S.token = r.token; store('vz_token', r.token); refresh(); }
+  catch (e) { toast(e.message, true); }
+}
+async function logout() { try { await api('logout', S.token); } catch (e) {} store('vz_token', null); S.token = null; renderLogin(); }
+async function refresh(keepTab) {
+  try {
+    S.d = await api('getData', S.token);
+    const u = S.d.user;
+    $('#who').innerHTML = `${esc(u.name)}<br><small>${esc(u.role)}${u.house ? ' · ' + H(u.house) : ''}</small> <button class="btn ghost sm" onclick="logout()">Sign out</button>`;
+    renderShell(keepTab ? S.tab : null);
+  } catch (e) { if (S.token) toast(e.message, true); }
+}
+
+/* ================= shell / tabs ================= */
+function tabsFor(role) {
+  if (role === 'AUTHORITY') return [['dash', 'Dashboard'], ['add', 'Add entry'], ['entries', 'All entries'], ['gaps', 'Gaps'], ['events', 'Events'], ['rules', 'Rules'], ['users', 'Users'], ['exc', 'Exceptions'], ['results', 'Results'], ['board', 'Scoreboard'], ['audit', 'Audit log']];
+  if (role === 'JUDGE') return [['results', 'Results'], ['board', 'Scoreboard']];
+  return [['add', 'Add entry'], ['mine', 'My house'], ['gaps', 'Gaps'], ['rulesView', 'Rules'], ['board', 'Scoreboard']];
+}
+function renderShell(tab) {
+  const t = tabsFor(S.d.user.role);
+  S.tab = tab && t.some(x => x[0] === tab) ? tab : t[0][0];
+  $('#app').innerHTML = `<nav class="tabs">${t.map(x => `<button class="${x[0] === S.tab ? 'on' : ''}" onclick="go('${x[0]}')">${x[1]}${x[0] === 'mine' || x[0] === 'entries' ? pendBadge() : ''}</button>`).join('')}</nav><section id="view"></section>`;
+  VIEWS[S.tab]();
+}
+function pendBadge() { const n = S.d.entries.filter(e => e.Status === 'Pending').length; return n ? ` (${n})` : ''; }
+function go(t) { renderShell(t); }
+
+const VIEWS = {
+  dash: viewDash, add: viewAdd, mine: viewMine, entries: viewEntries, gaps: viewGaps, events: viewEvents,
+  rules: viewRules, rulesView: viewRulesRO, users: viewUsers, exc: viewExc, results: viewResults, board: viewBoardTab, audit: viewAudit
+};
+
+/* ================= dashboard (authority) ================= */
+function viewDash() {
+  const E = S.d.entries, hs = S.d.houses;
+  const by = (h, st) => E.filter(e => e.House === h && e.Status === st).length;
+  const studs = h => S.d.students.filter(s => s.House === h);
+  const noEvent = h => studs(h).filter(s => !E.some(e => String(e.AdmNo) === String(s.AdmNo) && ['Approved', 'Pending'].includes(e.Status))).length;
+  $('#view').innerHTML = `
+  <div class="grid">
+    <div class="stat"><b>${E.filter(e => e.Status === 'Approved').length}</b><small>Approved entries</small></div>
+    <div class="stat"><b>${E.filter(e => e.Status === 'Pending').length}</b><small>Waiting for approval</small></div>
+    <div class="stat"><b>${S.d.events.filter(isEntryEvent).length}</b><small>Events taking entries</small></div>
+    <div class="stat"><b>${S.d.students.length}</b><small>Students</small></div>
+  </div>
+  <div class="card" style="margin-top:12px"><h3>House status</h3><div class="tbl"><table>
+    <tr><th>House</th><th>Students</th><th>Approved</th><th>Pending</th><th>Rejected</th><th>No event yet</th></tr>
+    ${hs.map(h => `<tr><td>${H(h)}</td><td>${studs(h).length}</td><td>${by(h, 'Approved')}</td><td>${by(h, 'Pending')}</td><td>${by(h, 'Rejected')}</td><td>${noEvent(h)}</td></tr>`).join('')}
+  </table></div></div>
+  <div class="card"><h3>Quick controls</h3><p class="small muted">Lock or unlock a whole day's entries (Rules → ENTRY_LOCK).</p>
+  <div class="row">${['Exhibition', 'Arts', 'Sports'].map(m => { const r = S.d.rules.find(x => x.RuleID === 'ENTRY_LOCK' && x.Scope === m); const locked = r && yes(r.Active) && yes(r.Value);
+    return `<button class="btn ${locked ? 'red' : 'green'}" onclick="toggleLock('${m}')">${m}: ${locked ? 'LOCKED — unlock' : 'open — lock'}</button>`; }).join('')}</div></div>`;
+}
+async function toggleLock(m) {
+  const r = S.d.rules.find(x => x.RuleID === 'ENTRY_LOCK' && x.Scope === m) || { RuleID: 'ENTRY_LOCK', Description: 'Lock all entries for a day', Scope: m, Active: 'Yes', Value: 'No' };
+  const next = Object.assign({}, r, { Value: yes(r.Value) && yes(r.Active) ? 'No' : 'Yes', Active: 'Yes' });
+  try { await saveRuleRow(next, r); toast(m + ' entries ' + (yes(next.Value) ? 'locked' : 'opened')); refresh(true); } catch (e) { toast(e.message, true); }
+}
+
+/* ================= add entry ================= */
+function viewAdd() {
+  const u = S.d.user, auth = u.role === 'AUTHORITY';
+  const f = S.f.add || (S.f.add = { mod: 'Arts', cat: '', house: auth ? (S.d.houses[0] || '') : u.house, ev: '', adm: '' });
+  const house = auth ? f.house : u.house;
+  const evs = S.d.events.filter(e => isEntryEvent(e) && e.Module === f.mod && (!f.cat || e.Category === f.cat));
+  const cats = [...new Set(S.d.events.filter(e => e.Module === f.mod && isEntryEvent(e)).map(e => e.Category))];
+  const ev = evById(f.ev);
+  const studs = ev.EventID ? S.d.students.filter(s => s.House === house && eligible(ev, s)).sort((a, b) => cidx(a.Class) - cidx(b.Class) || a.Name.localeCompare(b.Name)) : [];
+  const hc = e => S.d.houseCount[e.EventID + '|' + house] || 0;
+  $('#view').innerHTML = `<div class="card"><h3>Add a participant</h3>
+    ${auth ? `<label>House</label><select onchange="S.f.add.house=this.value;S.f.add.adm='';viewAdd()">${S.d.houses.map(h => `<option ${h === f.house ? 'selected' : ''}>${esc(h)}</option>`).join('')}</select>` : `<p class="small muted">Adding for ${H(house)}. ${u.role === 'LEADER' && !(S.d.rules.find(r => r.RuleID === 'LEADER_AUTO_APPROVE' && yes(r.Value))) ? 'Your entries go to <b>Pending</b> until approved.' : ''}</p>`}
+    <div class="row">
+      <div><label>Day</label><select onchange="S.f.add.mod=this.value;S.f.add.cat='';S.f.add.ev='';S.f.add.adm='';viewAdd()">${['Exhibition', 'Arts', 'Sports'].map(m => `<option ${m === f.mod ? 'selected' : ''}>${m}</option>`).join('')}</select></div>
+      <div><label>Category</label><select onchange="S.f.add.cat=this.value;S.f.add.ev='';S.f.add.adm='';viewAdd()"><option value="">All</option>${cats.map(c => `<option ${c === f.cat ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></div>
+    </div>
+    <label>Event</label><select onchange="S.f.add.ev=this.value;S.f.add.adm='';viewAdd()"><option value="">— choose event —</option>
+      ${evs.map(e => `<option value="${esc(e.EventID)}" ${e.EventID === f.ev ? 'selected' : ''}>${esc(e.Event)} · ${esc(e.Gender)} — ${hc(e)}/${e.MaxPerHouse || '∞'}${yes(e.Locked) ? ' · LOCKED' : ''}</option>`).join('')}</select>
+    ${ev.EventID ? `<p class="small muted">Class ${esc(ev.FromClass)}–${esc(ev.ToClass)} · ${esc(ev.Gender)} · ${esc(ev.Type)}${ev.MaxPerHouse ? ' · max ' + esc(ev.MaxPerHouse) + ' per house' : ' · no per-house limit'}${yes(ev.CountsToLimit) ? ' · counts towards item limit' : ' · does not count towards item limit'}${ev.Date ? ' · ' + esc(ev.Date) + ' ' + esc(ev.Start) : ''}</p>` : ''}
+    <label>Student (eligible ${esc(house)} students only)</label>
+    <select id="stuSel" ${ev.EventID ? '' : 'disabled'} onchange="S.f.add.adm=this.value;preview()"><option value="">— choose student —</option>
+      ${studs.map(s => `<option value="${esc(s.AdmNo)}" ${String(s.AdmNo) === String(f.adm) ? 'selected' : ''}>${esc(s.Name)} · Cl ${esc(s.Class)} · ${esc(s.AdmNo)} · items ${cnt(s.AdmNo, ev.Module)}</option>`).join('')}</select>
+    <label>Note (optional)</label><input id="addNote" placeholder="e.g. song title, team name">
+    <div id="chk"></div>
+    <div style="margin-top:12px"><button id="addBtn" class="btn" disabled onclick="saveEntry()">Add entry</button></div></div>
+    ${ev.EventID ? currentForEvent(ev, house) : ''}`;
+  if (f.adm) preview();
+}
+function currentForEvent(ev, house) {
+  const list = S.d.entries.filter(e => e.EventID === ev.EventID && e.House === house && ['Approved', 'Pending'].includes(e.Status));
+  return `<div class="card"><h3>${H(house)} in this event (${list.length}/${ev.MaxPerHouse || '∞'})</h3>${list.length ? `<div class="list">${list.map(e => `<div class="item"><div>${esc(e.StudentName)} <span class="muted small">Cl ${esc(e.Class)}</span></div>${pill(e.Status)}</div>`).join('')}</div>` : '<p class="muted small">No one yet.</p>'}</div>`;
+}
+async function preview() {
+  const f = S.f.add; $('#addBtn').disabled = true;
+  if (!f.ev || !f.adm) { $('#chk').innerHTML = ''; return; }
+  $('#chk').innerHTML = '<div class="check">Checking rules…</div>';
+  try {
+    const v = await api('previewEntry', S.token, f.ev, f.adm);
+    if (!v.length) { $('#chk').innerHTML = '<div class="check ok">✓ All rules passed.</div>'; $('#addBtn').disabled = false; }
+    else $('#chk').innerHTML = `<div class="check bad"><b>Not allowed:</b><br>${v.map(x => '• ' + esc(x.msg)).join('<br>')}</div>`;
+  } catch (e) { $('#chk').innerHTML = `<div class="check bad">${esc(e.message)}</div>`; }
+}
+async function saveEntry() {
+  const f = S.f.add; $('#addBtn').disabled = true;
+  try { const r = await api('addEntry', S.token, f.ev, f.adm, $('#addNote').value); toast('Saved — ' + r.status); f.adm = ''; refresh(true); }
+  catch (e) { toast(e.message, true); $('#addBtn').disabled = false; }
+}
+
+/* ================= my house (leader / teacher) ================= */
+function viewMine() {
+  const u = S.d.user, canApprove = u.role === 'TEACHER' || (u.role === 'LEADER' && S.d.leaderCanApprove);
+  const f = S.f.mine || (S.f.mine = { st: 'Pending', mod: '' });
+  const list = S.d.entries.filter(e => (!f.st || e.Status === f.st) && (!f.mod || e.Module === f.mod)).sort((a, b) => String(a.EventName).localeCompare(b.EventName));
+  $('#view').innerHTML = `<div class="card"><div class="row no-print">
+     <div><label>Status</label><select onchange="S.f.mine.st=this.value;viewMine()">${['', 'Pending', 'Approved', 'Rejected', 'Withdrawn'].map(s => `<option value="${s}" ${s === f.st ? 'selected' : ''}>${s || 'All'}</option>`).join('')}</select></div>
+     <div><label>Day</label><select onchange="S.f.mine.mod=this.value;viewMine()">${['', 'Exhibition', 'Arts', 'Sports'].map(s => `<option value="${s}" ${s === f.mod ? 'selected' : ''}>${s || 'All'}</option>`).join('')}</select></div>
+     <div style="flex:0 0 auto;align-self:flex-end"><button class="btn ghost" onclick="printHouse()">Print approved list</button></div></div>
+   ${f.st === 'Pending' && canApprove && list.length ? `<div style="margin-top:10px"><button class="btn green sm" onclick="approveAll()">Approve all ${list.length} shown</button></div>` : ''}
+   <div class="list" style="margin-top:8px">${list.map(e => `<div class="item"><div><b>${esc(e.StudentName)}</b> <span class="muted small">Cl ${esc(e.Class)} · ${esc(e.AdmNo)}</span><br><span class="small">${esc(e.EventName)}</span>
+      <br><span class="small muted">added by ${esc(e.AddedBy)}${e.Note ? ' · ' + esc(e.Note) : ''}</span></div>
+      <div class="act">${pill(e.Status)}
+        ${e.Status === 'Pending' && canApprove ? `<button class="btn green sm" onclick="act('approveEntry','${e.EntryID}')">Approve</button><button class="btn red sm" onclick="rej('${e.EntryID}')">Reject</button>` : ''}
+        ${e.Status === 'Pending' ? `<button class="btn ghost sm" onclick="act('withdrawEntry','${e.EntryID}')">Withdraw</button>` : ''}</div></div>`).join('') || '<p class="muted">Nothing here.</p>'}</div>
+   <p class="small muted">Approved entries can be changed only by the school authority.</p></div>`;
+}
+async function act(fn, id) { try { await api(fn, S.token, id); toast('Done'); refresh(true); } catch (e) { toast(e.message, true); } }
+async function rej(id) { const r = prompt('Reason for rejecting?'); if (r === null) return; try { await api('rejectEntry', S.token, id, r); toast('Rejected'); refresh(true); } catch (e) { toast(e.message, true); } }
+async function approveAll() {
+  const ids = S.d.entries.filter(e => e.Status === 'Pending' && (!S.f.mine.mod || e.Module === S.f.mine.mod)).map(e => e.EntryID);
+  let ok = 0, bad = [];
+  for (const id of ids) { try { await api('approveEntry', S.token, id); ok++; } catch (e) { bad.push(e.message); } }
+  toast(`${ok} approved${bad.length ? ', ' + bad.length + ' blocked by rules' : ''}`, bad.length > 0); refresh(true);
+}
+function printHouse() {
+  const u = S.d.user, list = S.d.entries.filter(e => e.Status === 'Approved').sort((a, b) => String(a.EventName).localeCompare(b.EventName));
+  const groups = {}; list.forEach(e => (groups[e.EventName] = groups[e.EventName] || []).push(e));
+  const w = window.open('', '_blank');
+  w.document.write(`<html><head><title>${esc(u.house || 'All houses')} participation</title><style>body{font-family:sans-serif;font-size:12px;margin:18px}h1{font-size:18px;margin:0}h2{font-size:13px;margin:14px 0 4px;background:#0b1b3f;color:#fff;padding:4px 8px}table{width:100%;border-collapse:collapse}td{border-bottom:1px solid #ccc;padding:3px 6px}</style></head><body>
+    <h1>Vivekananda Public School, Daporijo · VIBRANZA 2026–27</h1><p>${esc(u.house || 'All houses')} — approved participation list · printed ${new Date().toLocaleString()}</p>
+    ${Object.keys(groups).map(k => `<h2>${esc(k)}</h2><table>${groups[k].map((e, i) => `<tr><td width=24>${i + 1}</td><td>${esc(e.StudentName)}</td><td width=60>Cl ${esc(e.Class)}</td><td width=70>${esc(e.AdmNo)}</td><td width=70>${esc(e.House)}</td></tr>`).join('')}</table>`).join('')}
+    <script>window.print()<\/script></body></html>`);
+  w.document.close();
+}
+
+/* ================= all entries (authority) ================= */
+function viewEntries() {
+  const f = S.f.ent || (S.f.ent = { st: 'Pending', house: '', mod: '', q: '' });
+  const q = f.q.toLowerCase();
+  const list = S.d.entries.filter(e => (!f.st || e.Status === f.st) && (!f.house || e.House === f.house) && (!f.mod || e.Module === f.mod) &&
+    (!q || (e.StudentName + ' ' + e.EventName + ' ' + e.AdmNo).toLowerCase().includes(q)));
+  $('#view').innerHTML = `<div class="card"><div class="row">
+    <div><label>Status</label><select onchange="S.f.ent.st=this.value;viewEntries()">${['', 'Pending', 'Approved', 'Rejected', 'Withdrawn'].map(s => `<option value="${s}" ${s === f.st ? 'selected' : ''}>${s || 'All'}</option>`).join('')}</select></div>
+    <div><label>House</label><select onchange="S.f.ent.house=this.value;viewEntries()"><option value="">All</option>${S.d.houses.map(h => `<option ${h === f.house ? 'selected' : ''}>${h}</option>`).join('')}</select></div>
+    <div><label>Day</label><select onchange="S.f.ent.mod=this.value;viewEntries()">${['', 'Exhibition', 'Arts', 'Sports'].map(s => `<option value="${s}" ${s === f.mod ? 'selected' : ''}>${s || 'All'}</option>`).join('')}</select></div>
+    <div><label>Search</label><input value="${esc(f.q)}" onchange="S.f.ent.q=this.value;viewEntries()" placeholder="name, event, adm no"></div></div>
+    <p class="small muted">${list.length} entries. <button class="btn ghost sm" onclick="printHouse()">Print approved</button></p>
+    <div class="tbl"><table><tr><th>Student</th><th>Event</th><th>House</th><th>Status</th><th>By</th><th></th></tr>
+    ${list.map(e => `<tr><td>${esc(e.StudentName)}<br><span class="small muted">Cl ${esc(e.Class)} · ${esc(e.AdmNo)}</span></td><td class="small">${esc(e.EventName)}</td><td>${H(e.House)}</td><td>${pill(e.Status)}</td>
+      <td class="small">${esc(e.AddedBy)}${e.ApprovedBy ? '<br>✓ ' + esc(e.ApprovedBy) : ''}</td>
+      <td style="white-space:nowrap">${e.Status === 'Pending' ? `<button class="btn green sm" onclick="act('approveEntry','${e.EntryID}')">✓</button> <button class="btn red sm" onclick="rej('${e.EntryID}')">✕</button> ` : ''}<button class="btn ghost sm" onclick="editEntry('${e.EntryID}')">Edit</button></td></tr>`).join('')}
+    </table></div></div>`;
+}
+function editEntry(id) {
+  const e = S.d.entries.find(x => x.EntryID === id);
+  modal(`<h3>Edit entry (authority)</h3>
+    <label>Event</label><select id="eeEv">${S.d.events.filter(isEntryEvent).map(v => `<option value="${esc(v.EventID)}" ${v.EventID === e.EventID ? 'selected' : ''}>${esc(v.Event)} · ${esc(v.Gender)}</option>`).join('')}</select>
+    <label>Student Adm No</label><input id="eeAdm" value="${esc(e.AdmNo)}" list="admList"><datalist id="admList">${S.d.students.map(s => `<option value="${esc(s.AdmNo)}">${esc(s.Name)} · ${esc(s.House)}</option>`).join('')}</datalist>
+    <label>Status</label><select id="eeSt">${['Pending', 'Approved', 'Rejected', 'Withdrawn'].map(s => `<option ${s === e.Status ? 'selected' : ''}>${s}</option>`).join('')}</select>
+    <div id="eeMsg"></div>
+    <div class="row" style="margin-top:14px"><button class="btn" onclick="saveEdit('${id}',false)">Save</button><button class="btn red" onclick="delEntry('${id}')">Delete</button><button class="btn ghost" onclick="closeModal()">Cancel</button></div>`);
+}
+async function saveEdit(id, force) {
+  const ch = { EventID: $('#eeEv').value, AdmNo: $('#eeAdm').value.trim(), Status: $('#eeSt').value };
+  let reason = '';
+  if (force) { reason = prompt('Reason for overriding the rules (saved in the audit log):'); if (!reason) return; }
+  try {
+    const r = await api('adminEditEntry', S.token, id, ch, force, reason);
+    if (r.ok) { closeModal(); toast('Saved'); refresh(true); return; }
+    $('#eeMsg').innerHTML = `<div class="check bad"><b>Breaks rules:</b><br>${r.violations.map(v => '• ' + esc(v.msg)).join('<br>')}<br><button class="btn red sm" style="margin-top:8px" onclick="saveEdit('${id}',true)">Override with reason</button></div>`;
+  } catch (e) { toast(e.message, true); }
+}
+async function delEntry(id) { const r = prompt('Reason for deleting?'); if (r === null) return; try { await api('adminDeleteEntry', S.token, id, r); closeModal(); toast('Deleted'); refresh(true); } catch (e) { toast(e.message, true); } }
+
+/* ================= gaps ================= */
+function viewGaps() {
+  const auth = S.d.user.role === 'AUTHORITY';
+  const house = auth ? (S.f.gapH || S.d.houses[0]) : S.d.user.house;
+  const live = S.d.entries.filter(e => ['Approved', 'Pending'].includes(e.Status) && e.House === house);
+  const studs = S.d.students.filter(s => s.House === house);
+  const none = studs.filter(s => !live.some(e => String(e.AdmNo) === String(s.AdmNo))).sort((a, b) => cidx(a.Class) - cidx(b.Class));
+  const evs = S.d.events.filter(e => isEntryEvent(e) && studs.some(s => eligible(e, s)));
+  const empty = evs.filter(e => !live.some(x => x.EventID === e.EventID));
+  const under = evs.filter(e => { const n = live.filter(x => x.EventID === e.EventID).length; return n > 0 && Number(e.MaxPerHouse) > n; });
+  $('#view').innerHTML = `${auth ? `<div class="card"><label>House</label><select onchange="S.f.gapH=this.value;viewGaps()">${S.d.houses.map(h => `<option ${h === house ? 'selected' : ''}>${h}</option>`).join('')}</select></div>` : ''}
+   <div class="card"><h3>Events with no ${H(house)} entry (${empty.length})</h3>${empty.map(e => `<span class="chip">${esc(e.Event)} · ${esc(e.Gender)}</span>`).join(' ') || '<p class="muted">None 🎉</p>'}</div>
+   <div class="card"><h3>Events with free places (${under.length})</h3>${under.map(e => `<span class="chip">${esc(e.Event)} · ${live.filter(x => x.EventID === e.EventID).length}/${e.MaxPerHouse}</span>`).join(' ') || '<p class="muted">None</p>'}</div>
+   <div class="card"><h3>Students not in any event (${none.length})</h3><div class="list">${none.map(s => `<div class="item"><span>${esc(s.Name)}</span><span class="muted small">Cl ${esc(s.Class)} · ${esc(s.Gender)}</span></div>`).join('') || '<p class="muted">Everyone is in at least one event.</p>'}</div></div>`;
+}
+
+/* ================= events editor (authority) ================= */
+const EV_EDIT = ['MaxPerHouse', 'CountsToLimit', 'ReqBoys', 'ReqGirls', 'Date', 'Start', 'End', 'Venue', 'InCharge', 'Locked'];
+function viewEvents() {
+  const f = S.f.ev || (S.f.ev = { mod: 'Arts', q: '' });
+  const list = S.d.events.filter(e => (!f.mod || e.Module === f.mod) && (!f.q || String(e.Event).toLowerCase().includes(f.q.toLowerCase())));
+  $('#view').innerHTML = `<div class="card"><div class="row">
+    <div><label>Day</label><select onchange="S.f.ev.mod=this.value;viewEvents()">${['', 'Election', 'Exhibition', 'Arts', 'Sports', 'Fest'].map(s => `<option value="${s}" ${s === f.mod ? 'selected' : ''}>${s || 'All'}</option>`).join('')}</select></div>
+    <div><label>Search</label><input value="${esc(f.q)}" onchange="S.f.ev.q=this.value;viewEvents()"></div>
+    <div style="flex:0 0 auto;align-self:flex-end"><button class="btn gold" onclick="editEvent()">+ New event</button></div></div>
+    <div class="tbl" style="margin-top:10px"><table><tr><th>ID</th><th>Event</th><th>Class</th><th>Gender</th><th>Type</th><th>Max/house</th><th>Counts</th><th>Date · time</th><th>Lock</th><th></th></tr>
+    ${list.map(e => `<tr><td class="small">${esc(e.EventID)}</td><td>${esc(e.Event)}</td><td class="small">${esc(e.FromClass)}–${esc(e.ToClass)}</td><td class="small">${esc(e.Gender)}</td><td class="small">${esc(e.Type)}</td>
+      <td>${esc(e.MaxPerHouse || '∞')}</td><td>${yes(e.CountsToLimit) ? '✓' : ''}</td><td class="small">${esc(e.Date)} ${esc(e.Start)}${e.End ? '–' + esc(e.End) : ''}</td><td>${yes(e.Locked) ? '🔒' : ''}</td>
+      <td><button class="btn ghost sm" onclick="editEvent('${esc(e.EventID)}')">Edit</button></td></tr>`).join('')}</table></div></div>`;
+}
+const EV_FIELDS = ['EventID', 'Module', 'Event', 'Category', 'FromClass', 'ToClass', 'Gender', 'Type', 'MaxPerHouse', 'CountsToLimit', 'ReqBoys', 'ReqGirls', 'Date', 'Start', 'End', 'Venue', 'InCharge', 'Locked', 'NoEntries'];
+function editEvent(id) {
+  const e = id ? evById(id) : { EventID: 'E' + String(S.d.events.length + 1).padStart(3, '0'), Module: 'Arts', Gender: 'Mixed', Type: 'Individual', CountsToLimit: 'Yes', Locked: 'No' };
+  const types = S.d.points.map(p => p.Type);
+  const sel = (k, opts) => `<select id="f_${k}">${opts.map(o => `<option ${String(o) === String(e[k] || '') ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+  const inp = (k, ph) => `<input id="f_${k}" value="${esc(e[k] || '')}" placeholder="${ph || ''}">`;
+  modal(`<h3>${id ? 'Edit' : 'New'} event</h3>
+    <div class="row"><div><label>Event ID</label>${inp('EventID')}</div><div><label>Day</label>${sel('Module', ['Election', 'Exhibition', 'Arts', 'Sports', 'Fest'])}</div></div>
+    <label>Event name</label>${inp('Event')}
+    <div class="row"><div><label>Category</label>${sel('Category', ['Kids', 'Sub-Junior', 'Junior', 'Senior', 'All'])}</div><div><label>Gender</label>${sel('Gender', ['Mixed', 'Boys', 'Girls'])}</div></div>
+    <div class="row"><div><label>From class</label>${sel('FromClass', S.d.classes)}</div><div><label>To class</label>${sel('ToClass', S.d.classes)}</div></div>
+    <div class="row"><div><label>Points type</label>${sel('Type', types)}</div><div><label>Max per house</label>${inp('MaxPerHouse', 'blank = no limit')}</div></div>
+    <div class="row"><div><label>Counts to item limit</label>${sel('CountsToLimit', ['Yes', 'No'])}</div><div><label>Locked</label>${sel('Locked', ['No', 'Yes'])}</div></div>
+    <div class="row"><div><label>Boys needed (team)</label>${inp('ReqBoys')}</div><div><label>Girls needed (team)</label>${inp('ReqGirls')}</div></div>
+    <div class="row"><div><label>Date</label><input id="f_Date" type="date" value="${esc(e.Date || '')}"></div><div><label>Start</label><input id="f_Start" type="time" value="${esc(e.Start || '')}"></div><div><label>End</label><input id="f_End" type="time" value="${esc(e.End || '')}"></div></div>
+    <div class="row"><div><label>Venue</label>${inp('Venue')}</div><div><label>In-charge (User ID)</label>${inp('InCharge')}</div></div>
+    <div class="row" style="margin-top:14px"><button class="btn" onclick="saveEvent('${esc(id || '')}')">Save</button>${id ? `<button class="btn red" onclick="delRow('Events','${esc(id)}')">Delete</button>` : ''}<button class="btn ghost" onclick="closeModal()">Cancel</button></div>`);
+  const cat = $('#f_Category'); if (cat && !id) cat.value = 'All';
+}
+async function saveEvent(orig) {
+  const r = {}; EV_FIELDS.forEach(k => { const el = $('#f_' + k); if (el) r[k] = el.value; });
+  if (!r.Event) return toast('Event name is required', true);
+  try { await api('adminSave', S.token, 'Events', r, orig || r.EventID); closeModal(); toast('Event saved'); refresh(true); } catch (e) { toast(e.message, true); }
+}
+async function delRow(table, key) { if (!confirm('Delete this ' + table.slice(0, -1).toLowerCase() + '?')) return; try { await api('adminDelete', S.token, table, key); closeModal(); toast('Deleted'); refresh(true); } catch (e) { toast(e.message, true); } }
+
+/* ================= rules ================= */
+function viewRules() {
+  const R = S.d.rules;
+  $('#view').innerHTML = `<div class="card"><h3>Rules (only the school authority can change these)</h3>
+    <p class="small muted">Scope = All, Exhibition, Arts, Sports or a single Event ID. The most specific active rule wins. Per-event limits (max per house, team mix) are in the Events tab.</p>
+    <div class="tbl"><table><tr><th>Rule</th><th>Description</th><th>Value</th><th>Scope</th><th>Active</th><th></th></tr>
+    ${R.map((r, i) => `<tr><td class="small"><b>${esc(r.RuleID)}</b></td><td class="small">${esc(r.Description)}<br><span class="muted">${esc(r.Notes || '')}</span></td>
+      <td><input id="rv${i}" value="${esc(r.Value)}" style="width:150px"></td>
+      <td><input id="rs${i}" value="${esc(r.Scope)}" style="width:100px"></td>
+      <td><select id="ra${i}"><option ${yes(r.Active) ? 'selected' : ''}>Yes</option><option ${yes(r.Active) ? '' : 'selected'}>No</option></select></td>
+      <td><button class="btn sm" onclick="saveRuleIdx(${i})">Save</button></td></tr>`).join('')}</table></div>
+    <div style="margin-top:12px"><button class="btn gold" onclick="newRule()">+ Add rule row</button></div></div>`;
+}
+async function saveRuleRow(next, orig) {
+  // Rules may repeat the same RuleID with different scopes, so the server matches on RuleID+Scope via a composite key column.
+  return api('saveRule', S.token, next, orig ? { RuleID: orig.RuleID, Scope: orig.Scope } : null);
+}
+async function saveRuleIdx(i) {
+  const r = S.d.rules[i], next = Object.assign({}, r, { Value: $('#rv' + i).value, Scope: $('#rs' + i).value, Active: $('#ra' + i).value });
+  try { await saveRuleRow(next, r); toast('Rule saved'); refresh(true); } catch (e) { toast(e.message, true); }
+}
+function newRule() {
+  const ids = ['MAX_ITEMS_PER_STUDENT', 'HOUSE_LIMIT', 'CLASS_RANGE', 'GENDER_MATCH', 'TIME_CLASH', 'COUNT_PENDING', 'LEADER_CAN_APPROVE', 'LEADER_AUTO_APPROVE', 'TEACHER_AUTO_APPROVE', 'ENTRY_LOCK', 'ENTRY_DEADLINE', 'CLOSE_HOURS_BEFORE'];
+  modal(`<h3>New rule row</h3><label>Rule</label><select id="nrId">${ids.map(x => `<option>${x}</option>`).join('')}</select>
+    <label>Description</label><input id="nrD"><div class="row"><div><label>Value</label><input id="nrV"></div><div><label>Scope</label><input id="nrS" value="All"></div></div>
+    <div class="row" style="margin-top:14px"><button class="btn" onclick="addRule()">Add</button><button class="btn ghost" onclick="closeModal()">Cancel</button></div>`);
+}
+async function addRule() {
+  const r = { RuleID: $('#nrId').value, Description: $('#nrD').value, Value: $('#nrV').value, Scope: $('#nrS').value, Active: 'Yes' };
+  try { await saveRuleRow(r, null); closeModal(); toast('Rule added'); refresh(true); } catch (e) { toast(e.message, true); }
+}
+function viewRulesRO() {
+  $('#view').innerHTML = `<div class="card"><h3>Rules in force</h3><div class="list">${S.d.rules.map(r => `<div class="item"><div><b>${esc(r.Description || r.RuleID)}</b><br><span class="small muted">${esc(r.Scope || 'All')}</span></div><span class="pill Approved">${esc(r.Value)}</span></div>`).join('')}</div>
+   <p class="small muted">Each event also has its own limit (max per house, team mix). Only the school authority can change rules.</p></div>`;
+}
+
+/* ================= users (authority) ================= */
+function viewUsers() {
+  $('#view').innerHTML = `<div class="card"><div class="row"><h3 style="flex:1">Users & PINs</h3><div style="flex:0 0 auto"><button class="btn gold" onclick="editUser()">+ Add user</button></div></div>
+    <div class="tbl"><table><tr><th>User ID</th><th>Name</th><th>Role</th><th>House</th><th>PIN</th><th>Active</th><th></th></tr>
+    ${S.d.users.map(u => `<tr><td>${esc(u.UserID)}</td><td>${esc(u.Name)}</td><td>${esc(u.Role)}</td><td>${H(u.House)}</td><td>${esc(u.PIN)}</td><td>${esc(u.Active)}</td><td><button class="btn ghost sm" onclick="editUser('${esc(u.UserID)}')">Edit</button></td></tr>`).join('')}</table></div></div>`;
+}
+function editUser(id) {
+  const u = id ? S.d.users.find(x => String(x.UserID) === String(id)) : { Role: 'LEADER', Active: 'Yes' };
+  modal(`<h3>${id ? 'Edit' : 'Add'} user</h3>
+    <label>User ID</label><input id="uId" value="${esc(u.UserID || '')}"><label>Name</label><input id="uN" value="${esc(u.Name || '')}">
+    <div class="row"><div><label>Role</label><select id="uR">${['AUTHORITY', 'TEACHER', 'LEADER', 'JUDGE'].map(r => `<option ${r === u.Role ? 'selected' : ''}>${r}</option>`).join('')}</select></div>
+    <div><label>House</label><select id="uH"><option value="">—</option>${S.d.houses.map(h => `<option ${h === u.House ? 'selected' : ''}>${h}</option>`).join('')}</select></div></div>
+    <div class="row"><div><label>PIN ${id ? '(leave •••• to keep)' : ''}</label><input id="uP" value="${esc(u.PIN || '')}" inputmode="numeric"></div><div><label>Active</label><select id="uA"><option ${yes(u.Active) ? 'selected' : ''}>Yes</option><option ${yes(u.Active) ? '' : 'selected'}>No</option></select></div></div>
+    <label>Phone</label><input id="uPh" value="${esc(u.Phone || '')}">
+    <div class="row" style="margin-top:14px"><button class="btn" onclick="saveUser('${esc(id || '')}')">Save</button>${id ? `<button class="btn red" onclick="delRow('Users','${esc(id)}')">Delete</button>` : ''}<button class="btn ghost" onclick="closeModal()">Cancel</button></div>`);
+}
+async function saveUser(orig) {
+  const r = { UserID: $('#uId').value.trim(), Name: $('#uN').value, Role: $('#uR').value, House: $('#uH').value, PIN: $('#uP').value.trim(), Active: $('#uA').value, Phone: $('#uPh').value };
+  if (!r.UserID) return toast('User ID required', true);
+  try { await api('adminSave', S.token, 'Users', r, orig || r.UserID); closeModal(); toast('User saved'); refresh(true); } catch (e) { toast(e.message, true); }
+}
+
+/* ================= exceptions (authority) ================= */
+function viewExc() {
+  const ids = ['MAX_ITEMS_PER_STUDENT', 'CLASS_RANGE', 'GENDER_MATCH', 'HOUSE_LIMIT', 'TIME_CLASH', 'ENTRY_DEADLINE', 'CLOSE_HOURS_BEFORE', 'TEAM_MIX', 'EVENT_LOCK', 'ENTRY_LOCK'];
+  $('#view').innerHTML = `<div class="card"><h3>Grant an exception</h3><p class="small muted">Lets one student bypass one rule (optionally for one event) without switching the rule off for everyone. Logged.</p>
+    <div class="row"><div><label>Student Adm No</label><input id="xA" list="xAL"><datalist id="xAL">${S.d.students.map(s => `<option value="${esc(s.AdmNo)}">${esc(s.Name)} · ${esc(s.House)}</option>`).join('')}</datalist></div>
+    <div><label>Rule</label><select id="xR">${ids.map(x => `<option>${x}</option>`).join('')}</select></div>
+    <div><label>Event ID (optional)</label><input id="xE" placeholder="blank = all events"></div></div>
+    <label>Reason</label><input id="xRe"><div style="margin-top:12px"><button class="btn" onclick="addExc()">Grant</button></div></div>
+    <div class="card"><h3>Exceptions</h3><div class="tbl"><table><tr><th>Student</th><th>Rule</th><th>Event</th><th>Reason</th><th>By</th><th></th></tr>
+    ${S.d.exceptions.map((x, i) => `<tr><td>${esc(stuById(x.AdmNo).Name || x.AdmNo)}</td><td class="small">${esc(x.RuleID)}</td><td class="small">${esc(x.EventID || 'all')}</td><td class="small">${esc(x.Reason)}</td><td class="small">${esc(x.GrantedBy)}</td><td><button class="btn red sm" onclick="delExc(${i})">✕</button></td></tr>`).join('')}</table></div></div>`;
+}
+async function addExc() {
+  const r = { AdmNo: $('#xA').value.trim(), RuleID: $('#xR').value, EventID: $('#xE').value.trim(), Reason: $('#xRe').value };
+  if (!r.AdmNo || !r.Reason) return toast('Adm No and reason are required', true);
+  try { await api('adminSave', S.token, 'Exceptions', r); toast('Exception granted'); refresh(true); } catch (e) { toast(e.message, true); }
+}
+async function delExc(i) { if (!confirm('Remove this exception?')) return; try { await api('adminDelete', S.token, 'Exceptions', null, i); toast('Removed'); refresh(true); } catch (e) { toast(e.message, true); } }
+
+/* ================= results ================= */
+function viewResults() {
+  const u = S.d.user, mine = S.d.events.filter(e => u.role === 'AUTHORITY' ? String(e.Type).toLowerCase() !== 'no points' : String(e.InCharge) === String(u.id));
+  const f = S.f.res || (S.f.res = { ev: '' });
+  const ev = evById(f.ev);
+  const cur = S.d.results.filter(r => String(r.EventID) === String(f.ev));
+  const team = ['Team game', 'Group stage', 'March past', 'Spirit', 'Business award'].includes(ev.Type);
+  const entrants = S.d.entries.filter(e => e.EventID === f.ev && e.Status === 'Approved');
+  const placeRow = p => { const r = cur.find(x => String(x.Place) === String(p)) || {};
+    return `<div class="row"><div style="flex:0 0 60px"><label>Place</label><input value="${p}" disabled></div>
+      ${team ? `<div><label>House</label><select id="rh${p}"><option value="">—</option>${S.d.houses.map(h => `<option ${h === r.House ? 'selected' : ''}>${h}</option>`).join('')}</select></div>`
+             : `<div><label>Student</label><select id="ra${p}"><option value="">—</option>${entrants.map(e => `<option value="${esc(e.AdmNo)}" ${String(e.AdmNo) === String(r.AdmNo) ? 'selected' : ''}>${esc(e.StudentName)} · ${esc(e.House)}</option>`).join('')}</select></div>`}</div>`; };
+  $('#view').innerHTML = `<div class="card"><h3>Enter results</h3>
+    <label>Event</label><select onchange="S.f.res.ev=this.value;viewResults()"><option value="">— choose —</option>${mine.map(e => `<option value="${esc(e.EventID)}" ${e.EventID === f.ev ? 'selected' : ''}>${esc(e.Module)} · ${esc(e.Event)} · ${esc(e.Gender)}${S.d.results.some(r => String(r.EventID) === String(e.EventID)) ? ' ✓' : ''}</option>`).join('')}</select>
+    ${ev.EventID ? `${[1, 2, 3, 4].map(placeRow).join('')}
+      <p class="small muted">${team ? 'House result.' : entrants.length + ' approved entrants.'} Points come from the Points table (${esc(ev.Type)}).${cur.length ? ' Status: ' + (cur.some(r => yes(r.Published)) ? 'Published' : 'Not published') : ''}</p>
+      <div class="row"><button class="btn" onclick="saveRes(${team})">Save results</button>
+      ${u.role === 'AUTHORITY' && cur.length ? `<button class="btn ghost" onclick="pubRes(${!cur.some(r => yes(r.Published))})">${cur.some(r => yes(r.Published)) ? 'Unpublish' : 'Publish'}</button>` : ''}</div>` : ''}</div>`;
+}
+async function saveRes(team) {
+  const places = [1, 2, 3, 4].map(p => team ? { Place: p, House: $('#rh' + p).value } : { Place: p, AdmNo: $('#ra' + p).value });
+  try { await api('saveResults', S.token, S.f.res.ev, places); toast('Results saved'); refresh(true); } catch (e) { toast(e.message, true); }
+}
+async function pubRes(p) { try { await api('publishResults', S.token, S.f.res.ev, p); toast(p ? 'Published' : 'Unpublished'); refresh(true); } catch (e) { toast(e.message, true); } }
+
+/* ================= scoreboard ================= */
+async function viewBoardTab() {
+  $('#view').innerHTML = '<div class="card center muted">Loading scoreboard…</div>';
+  try { const b = await api('getScoreboard'); $('#view').innerHTML = `<div class="card"><h3>House championship (published results)</h3>${boardTable(b)}<p class="small muted">Updated ${esc(b.updated)} · public screen: add ?view=board to the app address.</p></div>`; }
+  catch (e) { toast(e.message, true); }
+}
+function boardTable(b) {
+  return `<div class="tbl"><table><tr><th>#</th><th>House</th><th>Exhibition</th><th>Arts</th><th>Sports</th><th>Other</th><th>Total</th></tr>
+  ${b.rows.map((r, i) => `<tr><td>${i + 1}</td><td>${H(r.House)}</td><td>${r.Exhibition || 0}</td><td>${r.Arts || 0}</td><td>${r.Sports || 0}</td><td>${r.Fest || 0}</td><td><b>${r.Total}</b></td></tr>`).join('') || '<tr><td colspan=7 class="muted">No published results yet.</td></tr>'}</table></div>`;
+}
+async function renderBoard() {
+  document.querySelector('.top').style.display = 'none';
+  const paint = async () => {
+    try {
+      const b = await api('getScoreboard');
+      $('#app').outerHTML = `<main id="app" class="board"><h1>VIBRANZA 2026–27</h1><p style="text-align:center;color:#b9c6e6">House Championship · Vivekananda Public School, Daporijo</p>
+        ${b.rows.map((r, i) => `<div class="brow"><span class="rk">${i + 1}</span><span class="nm h-${esc(r.House)}" style="color:var(--${esc(r.House)})">${esc(r.House)}</span><span class="pt">${r.Total}</span></div>`).join('') || '<p style="text-align:center">Results will appear here.</p>'}
+        ${b.recent.length ? `<p style="text-align:center;margin-top:24px;color:#b9c6e6">Latest winners: ${b.recent.map(x => esc(x.Event) + ' — ' + esc(x.House)).join(' · ')}</p>` : ''}
+        <p style="text-align:center;font-size:12px;color:#7f8db0">Updated ${esc(b.updated)}</p></main>`;
+    } catch (e) {}
+  };
+  paint(); setInterval(paint, 30000);
+}
+
+/* ================= audit (authority) ================= */
+async function viewAudit() {
+  $('#view').innerHTML = '<div class="card center muted">Loading…</div>';
+  try {
+    const rows = await api('getAudit', S.token, 300);
+    $('#view').innerHTML = `<div class="card"><h3>Audit log (latest 300)</h3><div class="tbl"><table><tr><th>Time</th><th>User</th><th>Action</th><th>Details</th></tr>
+      ${rows.map(r => `<tr><td class="small">${esc(r.Time)}</td><td>${esc(r.User)}</td><td class="small"><b>${esc(r.Action)}</b></td><td class="small" style="max-width:420px;word-break:break-word">${esc(r.Details)}</td></tr>`).join('')}</table></div></div>`;
+  } catch (e) { toast(e.message, true); }
+}
+</script>
